@@ -22,10 +22,21 @@ muted. If any app tries to unmute a mic, MicGate mutes it again.
 - Several ways to toggle:
   - **Hold** the menu-bar icon for half a second
   - **⌘-click** the menu-bar icon
-  - **⌘ + the mic (dictation) key** on Mac keyboards (this is really ⌘F5)
-  - **⌃⌥⌘M**
+  - Two keyboard shortcuts you can change in **Settings…**. The defaults are
+    **⌃⌥⌘M** and **⌘ + the mic (dictation) key** on Mac keyboards (this is
+    really ⌘F5).
 - A plain click opens the menu. The mic key on its own still does
   dictation/Siri as normal.
+
+## Changing shortcuts
+
+Click the menu-bar icon, then **Settings…** (or press ⌘, while the menu is open).
+Click **Record** next to a shortcut and press the keys you want. Esc cancels,
+**Clear** removes a shortcut, and **Reset to defaults** restores ⌃⌥⌘M and ⌘F5.
+
+Shortcuts need a modifier key (⌘ ⌥ ⌃ ⇧) unless they are F-keys or special keys.
+With Accessibility allowed, shortcuts are caught before other apps, so they can
+even replace system shortcuts like ⌘F5.
 
 ## Install
 
@@ -43,9 +54,13 @@ cd macbook-universal-mic && ./install.sh
 This builds the app from source, copies it to `~/Applications`, and starts it at
 every login.
 
-**One-time permission** (only needed for the ⌘ + mic key shortcut):
+**One-time permission** (needed for shortcuts that clash with system shortcuts,
+like the default ⌘ + mic key):
 System Settings › Privacy & Security › Accessibility › switch **MicGate** on.
-If the shortcut isn't active, the menu shows a ⚠︎ line.
+If it isn't active, the menu and Settings window show a ⚠︎ line.
+
+If you rebuild later, macOS may forget this permission. To avoid that, see the
+signing note at the top of `build.sh`.
 
 ## Uninstall
 

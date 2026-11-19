@@ -258,15 +258,288 @@ final class HUD {
     }
 }
 
+// MARK: - Shortcuts
+
+struct Shortcut: Equatable {
+    var keyCode: Int64
+    var mods: UInt64      // subset of ⌃⌥⇧⌘ as CGEventFlags bits
+    var label: String     // key name shown in the UI, e.g. "M" or "F5"
+
+    static let modMask: UInt64 = CGEventFlags.maskCommand.rawValue | CGEventFlags.maskAlternate.rawValue |
+        CGEventFlags.maskControl.rawValue | CGEventFlags.maskShift.rawValue
+
+    var display: String {
+        var s = ""
+        if mods & CGEventFlags.maskControl.rawValue != 0 { s += "⌃" }
+        if mods & CGEventFlags.maskAlternate.rawValue != 0 { s += "⌥" }
+        if mods & CGEventFlags.maskShift.rawValue != 0 { s += "⇧" }
+        if mods & CGEventFlags.maskCommand.rawValue != 0 { s += "⌘" }
+        return s + label
+    }
+
+    func matches(_ code: Int64, _ flags: CGEventFlags) -> Bool {
+        code == keyCode && (flags.rawValue & Shortcut.modMask) == mods
+    }
+
+    func sameKeys(_ o: Shortcut) -> Bool { keyCode == o.keyCode && mods == o.mods }
+
+    var carbonMods: UInt32 {
+        var m = 0
+        if mods & CGEventFlags.maskCommand.rawValue != 0 { m |= cmdKey }
+        if mods & CGEventFlags.maskAlternate.rawValue != 0 { m |= optionKey }
+        if mods & CGEventFlags.maskControl.rawValue != 0 { m |= controlKey }
+        if mods & CGEventFlags.maskShift.rawValue != 0 { m |= shiftKey }
+        return UInt32(m)
+    }
+
+    static let fKeyNames: [Int64: String] = [
+        122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8",
+        101: "F9", 109: "F10", 103: "F11", 111: "F12", 105: "F13", 107: "F14", 113: "F15",
+        106: "F16", 64: "F17", 79: "F18", 80: "F19", 90: "F20",
+    ]
+    static let namedKeys: [Int64: String] = [
+        36: "↩", 48: "⇥", 49: "Space", 51: "⌫", 53: "⎋", 117: "⌦", 123: "←", 124: "→",
+        125: "↓", 126: "↑", 115: "Home", 119: "End", 116: "PgUp", 121: "PgDn", 176: "Mic key",
+    ]
+
+    static func label(for code: Int64, chars: String?) -> String {
+        if let n = fKeyNames[code] ?? namedKeys[code] { return n }
+        if let c = chars, let sc = c.unicodeScalars.first, sc.value >= 0x21, sc.value < 0xF700 {
+            return c.uppercased()
+        }
+        return "Key \(code)"
+    }
+
+    /// Needs a modifier unless it's an F-key or special key, so normal typing isn't hijacked.
+    var isAllowed: Bool { mods != 0 || Shortcut.fKeyNames[keyCode] != nil || keyCode >= 160 }
+
+    static let factory: [Shortcut?] = [
+        Shortcut(keyCode: Int64(kVK_ANSI_M),
+                 mods: CGEventFlags.maskControl.rawValue | CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskCommand.rawValue,
+                 label: "M"),
+        Shortcut(keyCode: 96, mods: CGEventFlags.maskCommand.rawValue, label: "F5"),   // ⌘ + mic key
+    ]
+}
+
+extension Shortcut {
+    init?(dict: [String: Any]) {
+        guard let k = (dict["k"] as? NSNumber)?.int64Value,
+              let m = (dict["m"] as? NSNumber)?.int64Value,
+              let l = dict["l"] as? String else { return nil }
+        self.init(keyCode: k, mods: UInt64(m), label: l)
+    }
+    var dict: [String: Any] { ["k": NSNumber(value: keyCode), "m": NSNumber(value: Int64(mods)), "l": label] }
+}
+
+enum ShortcutStore {
+    static let slots = 2
+    static func load() -> [Shortcut?] {
+        guard let arr = UserDefaults.standard.array(forKey: "shortcuts") as? [[String: Any]], arr.count == slots else {
+            return Shortcut.factory
+        }
+        return arr.map { Shortcut(dict: $0) }
+    }
+    static func save(_ s: [Shortcut?]) {
+        UserDefaults.standard.set(s.map { $0?.dict ?? [:] }, forKey: "shortcuts")
+    }
+}
+
+/// Read by the key tap callback (a C function pointer, so these must be globals).
+var activeShortcuts: [Shortcut?] = []
+var recordHandler: ((Shortcut) -> Void)?
+
+// MARK: - Settings window
+
+final class SettingsWindow: NSObject, NSWindowDelegate {
+    unowned let app: App
+    let window: NSWindow
+    private var fields: [NSTextField] = []
+    private var recordButtons: [NSButton] = []
+    private let status = NSTextField(wrappingLabelWithString: "")
+    private let axButton = NSButton(title: "Open Accessibility Settings", target: nil, action: nil)
+    private var recordingSlot: Int?
+    private var localMonitor: Any?
+
+    init(app: App) {
+        self.app = app
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 270),
+                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "MicGate Settings"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        let v = window.contentView!
+
+        let title = NSTextField(labelWithString: "Toggle-mute shortcuts")
+        title.font = .boldSystemFont(ofSize: 14)
+        title.frame = NSRect(x: 20, y: 228, width: 440, height: 22)
+        v.addSubview(title)
+
+        for i in 0..<ShortcutStore.slots {
+            let y = CGFloat(186 - i * 40)
+            let l = NSTextField(labelWithString: "Shortcut \(i + 1)")
+            l.frame = NSRect(x: 20, y: y + 4, width: 80, height: 20)
+            v.addSubview(l)
+
+            let f = NSTextField(labelWithString: "")
+            f.isBezeled = true
+            f.bezelStyle = .roundedBezel
+            f.drawsBackground = true
+            f.alignment = .center
+            f.font = .systemFont(ofSize: 15, weight: .medium)
+            f.frame = NSRect(x: 100, y: y, width: 150, height: 28)
+            v.addSubview(f)
+            fields.append(f)
+
+            let r = NSButton(title: "Record", target: self, action: #selector(record(_:)))
+            r.tag = i
+            r.bezelStyle = .rounded
+            r.frame = NSRect(x: 258, y: y, width: 130, height: 28)
+            v.addSubview(r)
+            recordButtons.append(r)
+
+            let c = NSButton(title: "Clear", target: self, action: #selector(clear(_:)))
+            c.tag = i
+            c.bezelStyle = .rounded
+            c.frame = NSRect(x: 390, y: y, width: 70, height: 28)
+            v.addSubview(c)
+        }
+
+        let tip = NSTextField(wrappingLabelWithString:
+            "Click Record, then press the keys. Esc cancels. ⌘ + the mic key on Mac keyboards records as ⌘F5. " +
+            "Holding or ⌘-clicking the menu-bar icon always works too.")
+        tip.font = .systemFont(ofSize: 11)
+        tip.textColor = .secondaryLabelColor
+        tip.frame = NSRect(x: 20, y: 86, width: 440, height: 30)
+        v.addSubview(tip)
+
+        status.font = .systemFont(ofSize: 11)
+        status.frame = NSRect(x: 20, y: 48, width: 440, height: 30)
+        v.addSubview(status)
+
+        axButton.target = self
+        axButton.action = #selector(openAccessibility)
+        axButton.bezelStyle = .rounded
+        axButton.frame = NSRect(x: 16, y: 12, width: 220, height: 28)
+        v.addSubview(axButton)
+
+        let reset = NSButton(title: "Reset to defaults", target: self, action: #selector(resetDefaults))
+        reset.bezelStyle = .rounded
+        reset.frame = NSRect(x: 314, y: 12, width: 150, height: 28)
+        v.addSubview(reset)
+    }
+
+    func show() {
+        reload()
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func reload() {
+        for i in 0..<ShortcutStore.slots {
+            let s = i < activeShortcuts.count ? activeShortcuts[i] : nil
+            fields[i].stringValue = recordingSlot == i ? "…" : (s?.display ?? "None")
+            recordButtons[i].title = recordingSlot == i ? "Press keys…" : "Record"
+        }
+        if keyTapPort != nil {
+            status.stringValue = "✓ Shortcuts are captured before other apps, so they also override system shortcuts like ⌘F5."
+            status.textColor = .secondaryLabelColor
+            axButton.isHidden = true
+        } else {
+            status.stringValue = "⚠︎ Accessibility is off for MicGate. Shortcuts that clash with system shortcuts " +
+                "(like ⌘F5, the ⌘ + mic key) won't work until you allow it."
+            status.textColor = .systemOrange
+            axButton.isHidden = false
+        }
+    }
+
+    @objc func record(_ sender: NSButton) { startRecording(sender.tag) }
+
+    @objc func clear(_ sender: NSButton) {
+        stopRecording()
+        var s = ShortcutStore.load()
+        s[sender.tag] = nil
+        ShortcutStore.save(s)
+        app.applyShortcuts()
+    }
+
+    @objc func resetDefaults() {
+        stopRecording()
+        ShortcutStore.save(Shortcut.factory)
+        app.applyShortcuts()
+    }
+
+    @objc func openAccessibility() {
+        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(u)
+        }
+    }
+
+    private func startRecording(_ slot: Int) {
+        stopRecording()
+        recordingSlot = slot
+        let finish: (Shortcut) -> Void = { [weak self] sc in self?.finishRecording(sc) }
+        if keyTapPort != nil {
+            // The tap sees the keys first, so even system combos like ⌘F5 can be recorded.
+            recordHandler = finish
+        } else {
+            app.unregisterCarbon()
+            localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+                var mods: UInt64 = 0
+                if e.modifierFlags.contains(.command) { mods |= CGEventFlags.maskCommand.rawValue }
+                if e.modifierFlags.contains(.option) { mods |= CGEventFlags.maskAlternate.rawValue }
+                if e.modifierFlags.contains(.control) { mods |= CGEventFlags.maskControl.rawValue }
+                if e.modifierFlags.contains(.shift) { mods |= CGEventFlags.maskShift.rawValue }
+                let code = Int64(e.keyCode)
+                finish(Shortcut(keyCode: code, mods: mods,
+                                label: Shortcut.label(for: code, chars: e.charactersIgnoringModifiers)))
+                return nil
+            }
+        }
+        reload()
+    }
+
+    private func finishRecording(_ sc: Shortcut) {
+        guard let slot = recordingSlot else { return }
+        if sc.keyCode == 53 && sc.mods == 0 {          // Esc: cancel
+            stopRecording()
+            app.applyShortcuts()
+            return
+        }
+        if !sc.isAllowed { NSSound.beep(); return }   // plain letter etc.: keep listening
+        stopRecording()
+        var s = ShortcutStore.load()
+        for i in s.indices where i != slot && s[i].map({ $0.sameKeys(sc) }) == true { s[i] = nil }
+        s[slot] = sc
+        ShortcutStore.save(s)
+        app.applyShortcuts()
+    }
+
+    private func stopRecording() {
+        recordHandler = nil
+        recordingSlot = nil
+        if let m = localMonitor { NSEvent.removeMonitor(m); localMonitor = nil }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if recordingSlot != nil {
+            stopRecording()
+            app.applyShortcuts()
+        }
+    }
+}
+
 // MARK: - Menu bar app
 
 final class App: NSObject, NSApplicationDelegate {
     let gate = Gate()
     var item: NSStatusItem!
-    var hotKeyRef: EventHotKeyRef?
     let hud = HUD()
     var holdTimer: Timer?
     var holdFired = false
+    var carbonRefs: [EventHotKeyRef] = []
+    lazy var settings = SettingsWindow(app: self)
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -282,15 +555,25 @@ final class App: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { NSApp.terminate(nil) }
             return
         }
+        if CommandLine.arguments.contains("--demo-settings") {
+            // Visual check only: show the Settings window, don't touch the mic, then exit.
+            activeShortcuts = ShortcutStore.load()
+            refresh()
+            settings.show()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { NSApp.terminate(nil) }
+            return
+        }
         gate.start()
-        registerHotKey()
+        installCarbonHandler()
+        applyShortcuts()
         tryInstallKeyTap(prompt: true)
         refresh()
     }
 
-    /// ⌘ + the keyboard's mic key. The mic key sends key code 176 on its own, but
-    /// ⌘+mic arrives as ⌘+F5 (key code 96). Swallow that combo and toggle mute.
-    /// Needs Accessibility permission; retries until it is granted.
+    /// Key tap: catches the configured shortcuts before any other app or system
+    /// shortcut (e.g. ⌘F5 = ⌘ + mic key, which macOS uses for VoiceOver) and swallows them.
+    /// Needs Accessibility permission; retries until it is granted. Without it,
+    /// shortcuts fall back to normal global hotkeys.
     func tryInstallKeyTap(prompt: Bool) {
         if keyTapPort != nil { return }
         if prompt {
@@ -304,7 +587,14 @@ final class App: NSObject, NSApplicationDelegate {
                 return Unmanaged.passUnretained(ev)
             }
             let code = ev.getIntegerValueField(.keyboardEventKeycode)
-            if code == 96 && ev.flags.contains(.maskCommand) {
+            if type == .keyDown, let h = recordHandler {
+                let chars = NSEvent(cgEvent: ev)?.charactersIgnoringModifiers
+                let sc = Shortcut(keyCode: code, mods: ev.flags.rawValue & Shortcut.modMask,
+                                  label: Shortcut.label(for: code, chars: chars))
+                DispatchQueue.main.async { h(sc) }
+                return nil
+            }
+            for case let s? in activeShortcuts where s.matches(code, ev.flags) {
                 if type == .keyDown && ev.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
                     DispatchQueue.main.async { appDelegate.toggle() }
                 }
@@ -318,11 +608,50 @@ final class App: NSObject, NSApplicationDelegate {
             let src = CFMachPortCreateRunLoopSource(nil, t, 0)
             CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
             CGEvent.tapEnable(tap: t, enable: true)
+            applyShortcuts()   // the tap handles shortcuts now; drop the fallback hotkeys
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 self?.tryInstallKeyTap(prompt: false)
             }
         }
+    }
+
+    func installCarbonHandler() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { appDelegate.toggle() }
+            return noErr
+        }, 1, &spec, nil, nil)
+    }
+
+    func unregisterCarbon() {
+        for r in carbonRefs { UnregisterEventHotKey(r) }
+        carbonRefs = []
+    }
+
+    /// Load shortcuts from settings. With the key tap active the tap handles them;
+    /// otherwise register them as ordinary global hotkeys.
+    func applyShortcuts() {
+        activeShortcuts = ShortcutStore.load()
+        unregisterCarbon()
+        if keyTapPort == nil {
+            for (i, s) in activeShortcuts.enumerated() {
+                guard let s else { continue }
+                var ref: EventHotKeyRef?
+                let id = EventHotKeyID(signature: OSType(0x4d475431), id: UInt32(i + 1))
+                if RegisterEventHotKey(UInt32(s.keyCode), s.carbonMods, id, GetApplicationEventTarget(), 0, &ref) == noErr,
+                   let ref {
+                    carbonRefs.append(ref)
+                }
+            }
+        }
+        refresh()
+        if settings.window.isVisible { settings.reload() }
+    }
+
+    var shortcutSummary: String {
+        let s = activeShortcuts.compactMap { $0?.display }
+        return s.isEmpty ? "no shortcuts set" : s.joined(separator: ", ")
     }
 
     /// Plain click = menu. Hold (~0.45s) or ⌘-click = toggle mute. Right-click = menu.
@@ -361,6 +690,8 @@ final class App: NSObject, NSApplicationDelegate {
         hud.show(muted: gate.muted, below: item.button)
     }
 
+    @objc func openSettings() { settings.show() }
+
     @objc func quit() {
         // Leave the mic usable when the app exits.
         gate.muted = false
@@ -374,15 +705,19 @@ final class App: NSObject, NSApplicationDelegate {
         t.target = self
         m.addItem(t)
         m.addItem(NSMenuItem(title: "Mics: " + gate.gatedNames.joined(separator: ", "), action: nil, keyEquivalent: ""))
-        m.addItem(NSMenuItem(title: "Hold the icon, ⌘-click, or ⌘+mic key to toggle", action: nil, keyEquivalent: ""))
+        m.addItem(NSMenuItem(title: "Toggle: hold or ⌘-click icon, " + shortcutSummary, action: nil, keyEquivalent: ""))
         if keyTapPort == nil {
-            m.addItem(NSMenuItem(title: "⚠︎ ⌘+mic key off: allow MicGate in Privacy › Accessibility", action: nil, keyEquivalent: ""))
+            m.addItem(NSMenuItem(title: "⚠︎ Accessibility off: system-clashing shortcuts (⌘F5) won't work",
+                                 action: nil, keyEquivalent: ""))
         }
         let bad = gate.uncontrollable
         if !bad.isEmpty {
             m.addItem(NSMenuItem(title: "⚠︎ Can't mute: " + bad.joined(separator: ", "), action: nil, keyEquivalent: ""))
         }
         m.addItem(.separator())
+        let s = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        s.target = self
+        m.addItem(s)
         let q = NSMenuItem(title: "Quit (unmutes)", action: #selector(quit), keyEquivalent: "q")
         q.target = self
         m.addItem(q)
@@ -403,18 +738,8 @@ final class App: NSObject, NSApplicationDelegate {
         }
         item.button?.image = img
         item.button?.contentTintColor = nil
-        item.button?.toolTip = "All mics: " + (gate.muted ? "MUTED" : "live") + " — hold or ⌘-click to toggle, ⌃⌥⌘M"
-    }
-
-    func registerHotKey() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { appDelegate.toggle() }
-            return noErr
-        }, 1, &spec, nil, nil)
-        let id = EventHotKeyID(signature: OSType(0x4d475431), id: 1)
-        RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(controlKey | optionKey | cmdKey), id,
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
+        item.button?.toolTip = "All mics: " + (gate.muted ? "MUTED" : "live") +
+            " — hold or ⌘-click to toggle; " + shortcutSummary
     }
 }
 

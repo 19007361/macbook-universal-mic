@@ -24,7 +24,11 @@ lipo -create "$OUT/MicGate-arm64" "$OUT/MicGate-x86_64" -output "$APP/Contents/M
 rm -f "$OUT/MicGate-arm64" "$OUT/MicGate-x86_64"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 
-# Ad-hoc signature (no Apple developer account needed).
-codesign --force --sign - "$APP"
+# Signing. By default the app is ad-hoc signed (no Apple developer account needed),
+# but then macOS treats every rebuild as a new app and you must re-allow it under
+# Accessibility. To keep that permission across rebuilds, sign with a stable identity:
+#   MICGATE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./build.sh
+# (list yours with: security find-identity -v -p codesigning)
+codesign --force --sign "${MICGATE_SIGN_IDENTITY:--}" --identifier local.micgate "$APP"
 
 echo "Built $APP"
